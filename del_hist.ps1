@@ -182,7 +182,7 @@ function Get-RepositoryCatalog {
     if ($LASTEXITCODE -eq 0) { $hasCommits = $true }
 
     if ($hasCommits) {
-        $histFiles = @(git log --all --pretty=format: --name-only 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
+        $histFiles = @(git log HEAD --pretty=format: --name-only 2>$null | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Sort-Object -Unique)
         foreach ($file in $histFiles) {
             $cleanFile = ($file -replace '\\', '/').Trim()
             if ($cleanFile -eq $ScriptSelfName) { continue }
@@ -238,7 +238,7 @@ function Get-RepositoryCatalog {
 # ESTÁGIO 0: SELETOR INTERATIVO TUI NO TERMINAL (OPÇÃO 1)
 # ==============================================================================
 function Show-InteractivePathSelector {
-    param([array]$Items)
+    param([array]$Items, [string]$BranchName)
 
     $cursor = 0
     $pageSize = 14
@@ -246,9 +246,9 @@ function Show-InteractivePathSelector {
     while ($true) {
         Clear-Host
         Write-Host "========================================================================================" -ForegroundColor Cyan
-        Write-Host " SELETOR DE EXPURGO DO HISTÓRICO GIT (Use Setas ↑/↓, [Espaço] p/ marcar, [Enter] p/ OK)" -ForegroundColor White
+        Write-Host " SELETOR DE EXPURGO DO HISTÓRICO GIT — BRANCH ATUAL: [$BranchName]" -ForegroundColor White
         Write-Host "========================================================================================" -ForegroundColor Cyan
-        Write-Host " Marque [x] os diretórios e arquivos que deseja APAGAR de todos os commits e branches:" -ForegroundColor Gray
+        Write-Host " Marque [x] os diretórios e arquivos para APAGAR dos commits da branch '$BranchName':" -ForegroundColor Gray
         Write-Host ""
 
         $total = $Items.Count
@@ -348,13 +348,18 @@ try {
     $RepoRoot = (git rev-parse --show-toplevel).Trim()
     Set-Location -LiteralPath $RepoRoot
 
+    $currentBranch = (git branch --show-current 2>$null)
+    if ([string]::IsNullOrWhiteSpace($currentBranch)) {
+        $currentBranch = "main"
+    }
+
     # --------------------------------------------------------------------------
-    # ESTÁGIO 0: SELEÇÃO DE ALVOS
+    # ESTÁGIO 0: SELEÇÃO DE ALVOS (ESCOPO: APENAS A BRANCH ATUAL)
     # --------------------------------------------------------------------------
     $catalog = Get-RepositoryCatalog -PreSelectedDefaults $DefaultAgentTargets -UserExtraPaths $ExtraPaths
 
     if (-not $NoInteractive) {
-        $catalog = Show-InteractivePathSelector -Items $catalog
+        $catalog = Show-InteractivePathSelector -Items $catalog -BranchName $currentBranch
     }
 
     $selectedItems = @($catalog | Where-Object { $_.Selected })
@@ -380,7 +385,7 @@ try {
     }
     $TargetPaths = @($targetPathsSet)
 
-    Write-Step "ESTÁGIO 0" "Alvos selecionados para expurgo total:"
+    Write-Step "ESTÁGIO 0" "Branch ativa: [$currentBranch] | Alvos selecionados para expurgo nesta branch:"
     foreach ($tp in $TargetPaths) {
         Write-Info "-> $tp"
     }
@@ -397,27 +402,22 @@ try {
         $originUrl = (git remote get-url origin 2>$null).Trim()
     }
 
-    $currentBranch = (git branch --show-current 2>$null)
-    if ([string]::IsNullOrWhiteSpace($currentBranch)) {
-        $currentBranch = "main"
-    }
-
     if ($DryRun) {
-        Write-Step "DRY-RUN" "Modo de simulação ativo. Nenhuma alteração será gravada."
+        Write-Step "DRY-RUN" "Modo de simulação ativo na branch '$currentBranch'. Nenhuma alteração será gravada."
         if ($hasCommits) {
-            $affectedCommits = @(git log --all --oneline -- @TargetPaths 2>$null)
-            Write-Info "Commits no histórico que tocam os alvos: $($affectedCommits.Count)"
+            $affectedCommits = @(git log $currentBranch --oneline -- @TargetPaths 2>$null)
+            Write-Info "Commits na branch '$currentBranch' que tocam os alvos: $($affectedCommits.Count)"
             foreach ($ac in $affectedCommits) { Write-Info "   $ac" }
         } else {
-            Write-Info "Repositório ainda não possui commits. A limpeza removeria apenas os arquivos locais."
+            Write-Info "A branch '$currentBranch' ainda não possui commits."
         }
         return
     }
 
     # --------------------------------------------------------------------------
-    # ESTÁGIO 1: PRÉ-VOO, BACKUP ESPELHADO (--MIRROR) E LIMPEZA DE DISCO ATUAL
+    # ESTÁGIO 1: PRÉ-VOO, BACKUP ESPELHADO (--MIRROR) E PRESERVAÇÃO LOCAL
     # --------------------------------------------------------------------------
-    Write-Step "ESTÁGIO 1" "Pré-voo, captura de snapshot de horários e backup de segurança..."
+    Write-Step "ESTÁGIO 1" "Pré-voo na branch '$currentBranch', captura de snapshot de horários e backup..."
 
     if (-not $SkipBackup -and $hasCommits) {
         $repoName = Split-Path -Leaf $RepoRoot
@@ -427,10 +427,10 @@ try {
         Write-Success "Backup espelhado (--mirror) criado em: $backupPath"
     }
 
-    # Captura mapa de timestamps originais antes da reescrita para auditoria forense no Estágio 6
+    # Captura mapa de timestamps originais da branch atual antes da reescrita
     $originalTimestamps = @{}
     if ($hasCommits) {
-        $rawLog = @(git log --all --format="%H|%aI|%cI|%s" 2>$null)
+        $rawLog = @(git log $currentBranch --format="%H|%aI|%cI|%s" 2>$null)
         foreach ($line in $rawLog) {
             $parts = $line -split '\|', 4
             if ($parts.Count -eq 4) {
@@ -536,30 +536,15 @@ try {
     git reset --hard HEAD >$null 2>&1
 
     # --------------------------------------------------------------------------
-    # ESTÁGIO 2: SINCRONIZAÇÃO E MATERIALIZAÇÃO DE TODAS AS BRANCHES REMOTAS
+    # ESTÁGIO 2: ISOLAMENTO DE ESCOPO NA BRANCH ATUAL
     # --------------------------------------------------------------------------
-    Write-Step "ESTÁGIO 2" "Sincronizando e materializando ramificações (branches) para preservar merge-base..."
-
-    if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
-        git fetch origin --prune --tags --quiet 2>$null
-        $remoteBranches = @(git for-each-ref --format="%(refname:short)" refs/remotes/origin/ 2>$null)
-        foreach ($rb in $remoteBranches) {
-            if ($rb -eq "origin/HEAD" -or $rb -eq "origin") { continue }
-            $localBranchName = $rb -replace '^origin/', ''
-            if ($localBranchName -ne $currentBranch) {
-                git branch -f $localBranchName $rb >$null 2>&1
-                Write-Info "Branch sincronizada para reescrita conjunta do grafo: $localBranchName"
-            }
-        }
-    }
-
-    $allLocalBranches = @(git for-each-ref --format="%(refname:short)" refs/heads/ 2>$null)
-    Write-Success "Total de branches locais prontas para reescrita unificada: $($allLocalBranches.Count) ($($allLocalBranches -join ', '))"
+    Write-Step "ESTÁGIO 2" "Isolando operação exclusivamente na branch atual: [$currentBranch]..."
+    Write-Success "Outras branches não serão alteradas. Para limpar outra branch, troque para ela (git checkout <branch>) e execute novamente."
 
     # --------------------------------------------------------------------------
-    # ESTÁGIO 3 & 4: REESCRITA DO GRAFO DAG (DUAL-ENGINE) SEM ALTERAR HORÁRIOS
+    # ESTÁGIO 3 & 4: REESCRITA EXCLUSIVA DA BRANCH ATUAL SEM ALTERAR HORÁRIOS
     # --------------------------------------------------------------------------
-    Write-Step "ESTÁGIO 3" "Reescrevendo árvore de commits em todas as branches e tags (preservando AuthorDate e CommitterDate)..."
+    Write-Step "ESTÁGIO 3" "Reescrevendo árvore de commits da branch '$currentBranch' (preservando AuthorDate e CommitterDate)..."
 
     # Verifica se git-filter-repo está disponível e funcional
     $hasFilterRepo = $false
@@ -569,18 +554,18 @@ try {
     }
 
     if ($hasFilterRepo) {
-        Write-Info "Motor selecionado: git-filter-repo (Motor Primário C-Speed)"
-        $filterRepoArgs = @("filter-repo", "--invert-paths", "--prune-empty=auto", "--force")
+        Write-Info "Motor selecionado: git-filter-repo (Escopo: refs/heads/$currentBranch)"
+        $filterRepoArgs = @("filter-repo", "--invert-paths", "--prune-empty=auto", "--refs", "refs/heads/$currentBranch", "--force")
         foreach ($tp in $TargetPaths) {
             $filterRepoArgs += "--path"
             $filterRepoArgs += $tp
         }
         & git @filterRepoArgs
         if ($LASTEXITCODE -ne 0) {
-            throw "Falha ao executar git-filter-repo."
+            throw "Falha ao executar git-filter-repo na branch '$currentBranch'."
         }
     } else {
-        Write-Info "Motor selecionado: git filter-branch --index-filter (Motor Nativo Universal)"
+        Write-Info "Motor selecionado: git filter-branch --index-filter (Escopo: refs/heads/$currentBranch)"
         $env:FILTER_BRANCH_SQUELCH_WARNING = "1"
 
         # Constrói lista de caminhos escapados para o POSIX sh interno do Git
@@ -608,8 +593,7 @@ try {
             "filter-branch",
             "-f",
             "--index-filter", $indexFilterCmd,
-            "--prune-empty",
-            "--tag-name-filter", "cat"
+            "--prune-empty"
         )
 
         if ($SanitizeMessages) {
@@ -620,12 +604,11 @@ try {
         }
 
         $filterBranchArgs += "--"
-        $filterBranchArgs += "--all"
+        $filterBranchArgs += $currentBranch
 
         & git @filterBranchArgs >$null 2>&1
         if ($LASTEXITCODE -ne 0) {
-            # Caso TODOS os commits da árvore fossem exclusivamente de .agent e tenham sido podados
-            Write-Warn "Todos os commits existentes continham apenas os arquivos expurgados."
+            Write-Warn "Todos os commits da branch '$currentBranch' continham apenas os arquivos expurgados."
         }
     }
 
@@ -671,13 +654,8 @@ try {
         Remove-Item -LiteralPath $filterRepoMeta -Recurse -Force
     }
 
-    # 3. Limpa referências remotas antigas que apontavam para os hashes pré-expurgo
-    $remoteRefs = @(git for-each-ref --format="%(refname)" refs/remotes/ 2>$null)
-    foreach ($rref in $remoteRefs) {
-        if (-not [string]::IsNullOrWhiteSpace($rref)) {
-            git update-ref -d $rref >$null 2>&1
-        }
-    }
+    # 3. Limpa a referência remota antiga apenas da branch atual (refs/remotes/origin/<branch>)
+    git update-ref -d "refs/remotes/origin/$currentBranch" >$null 2>&1
 
     # 4. Restaura a configuração do remote origin caso tenha sido removida pelo filter-repo
     if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
@@ -687,7 +665,7 @@ try {
         }
     }
 
-    # 5. Expira imediatamente todas as entradas do reflog (HEAD e todas as branches)
+    # 5. Expira imediatamente todas as entradas do reflog
     git reflog expire --expire=now --expire-unreachable=now --all >$null 2>&1
 
     # 6. Executa Garbage Collector agressivo para destruir fisicamente os blobs e trees antigos
@@ -699,22 +677,22 @@ try {
         Write-Info "Alterações locais legítimas restauradas do stash."
     }
 
-    Write-Success "Limpeza forense concluída: zero referências órfãs ou logs residuais."
+    Write-Success "Limpeza forense concluída na branch '$currentBranch': zero referências órfãs ou logs residuais."
 
     # --------------------------------------------------------------------------
-    # ESTÁGIO 6: AUDITORIA FORENSE AUTOMATIZADA E SINCRONIZAÇÃO REMOTA
+    # ESTÁGIO 6: AUDITORIA FORENSE AUTOMATIZADA E SINCRONIZAÇÃO REMOTA DA BRANCH ATUAL
     # --------------------------------------------------------------------------
-    Write-Step "ESTÁGIO 6" "Executando auditoria forense automatizada pós-expurgo..."
+    Write-Step "ESTÁGIO 6" "Executando auditoria forense automatizada na branch '$currentBranch'..."
 
-    $remainingCommitsWithTargets = @(git log --all --full-history --oneline -- @TargetPaths 2>$null)
+    $remainingCommitsWithTargets = @(git log $currentBranch --full-history --oneline -- @TargetPaths 2>$null)
     if ($remainingCommitsWithTargets.Count -eq 0) {
-        Write-Success "Auditoria de Caminhos: 0 vestígios encontrados em todas as branches e tags."
+        Write-Success "Auditoria de Caminhos: 0 vestígios encontrados na branch '$currentBranch'."
     } else {
-        Write-Err "Ainda foram encontrados $($remainingCommitsWithTargets.Count) commits referenciando os alvos!"
+        Write-Err "Ainda foram encontrados $($remainingCommitsWithTargets.Count) commits referenciando os alvos na branch '$currentBranch'!"
     }
 
-    # Verifica integridade dos horários (AuthorDate e CommitterDate idênticos aos originais)
-    $newLog = @(git log --all --format="%H|%aI|%cI|%s" 2>$null)
+    # Verifica integridade dos horários (AuthorDate e CommitterDate idênticos aos originais) na branch atual
+    $newLog = @(git log $currentBranch --format="%H|%aI|%cI|%s" 2>$null)
     $verifiedDatesCount = 0
     $dateMismatchCount = 0
     foreach ($line in $newLog) {
@@ -733,17 +711,17 @@ try {
     }
 
     if ($dateMismatchCount -eq 0) {
-        Write-Success "Auditoria de Horários: 100% dos commits sobreviventes ($verifiedDatesCount) mantiveram AuthorDate e CommitterDate originais intactos!"
+        Write-Success "Auditoria de Horários: 100% dos commits sobreviventes ($verifiedDatesCount) na branch '$currentBranch' mantiveram AuthorDate e CommitterDate originais intactos!"
     } else {
         Write-Warn "Foram detectadas $dateMismatchCount divergências de horário."
     }
 
-    # Push remoto automático no final do programa
+    # Push remoto automático exclusivamente da branch atual no final do programa
     if ($PushRemote) {
         if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
-            Write-Step "PUSH REMOTO" "Executando git push origin --force --all --prune; git push origin --force --tags ($originUrl)..."
-            git push origin --force --all --prune; git push origin --force --tags
-            Write-Success "Histórico remoto atualizado com sucesso em todas as branches e tags!"
+            Write-Step "PUSH REMOTO" "Executando git push origin --force refs/heads/${currentBranch}:refs/heads/${currentBranch} ($originUrl)..."
+            git push origin --force "refs/heads/${currentBranch}:refs/heads/${currentBranch}"
+            Write-Success "Histórico remoto da branch '$currentBranch' atualizado com sucesso no GitHub!"
         } else {
             Write-Warn "Nenhum remote 'origin' configurado neste repositório local (push ignorado)."
         }
