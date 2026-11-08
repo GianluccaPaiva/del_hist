@@ -53,7 +53,7 @@ param(
     [switch]$SanitizeMessages,
 
     [Parameter(Mandatory = $false)]
-    [switch]$PushRemote,
+    [bool]$PushRemote = $true,
 
     [Parameter(Mandatory = $false)]
     [switch]$DryRun,
@@ -458,16 +458,30 @@ try {
         }
     }
 
-    # Remove do disco local e do índice atual os arquivos/pastas selecionados
+    # Preserva em cofre temporário todos os arquivos/pastas selecionados que existem no disco local
+    # para que NÃO sejam apagados do projeto local (removidos apenas da árvore de commits e da nuvem GitHub)
+    $localVaultDir = Join-Path $env:TEMP "git-local-vault-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $localVaultDir -Force | Out-Null
+    $preservedItems = @()
+
     foreach ($tp in $TargetPaths) {
-        git rm -rf --cached --ignore-unmatch -- $tp >$null 2>&1
         if (Test-Path -LiteralPath $tp) {
-            Remove-Item -LiteralPath $tp -Recurse -Force -ErrorAction SilentlyContinue
-            Write-Success "Removido do diretório de trabalho: $tp"
+            $destPath = Join-Path $localVaultDir $tp
+            $destParent = Split-Path -Parent $destPath
+            if (-not (Test-Path -LiteralPath $destParent)) {
+                New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $tp -Destination $destPath -Recurse -Force
+            $preservedItems += $tp
         }
+        # Remove apenas do índice do Git (--cached), mantendo a cópia segura no cofre
+        git rm -rf --cached --ignore-unmatch -- $tp >$null 2>&1
+    }
+    if ($preservedItems.Count -gt 0) {
+        Write-Success "Arquivos locais preservados com segurança (serão mantidos no disco local e removidos apenas dos commits/nuvem): $($preservedItems -join ', ')"
     }
 
-    # Higieniza o .gitignore local no disco caso contenha referências aos alvos
+    # Higieniza o .gitignore local caso contenha referências aos alvos
     if ($CleanGitignore -and (Test-Path -LiteralPath ".gitignore")) {
         $escapedPatterns = ($TargetPaths | ForEach-Object { [Regex]::Escape($_) }) -join "|"
         $gitignoreRegex = "(?i)^\s*(#\s*Relat[oó]rios locais de sess[aã]o do agente.*|/?($escapedPatterns)/?\s*)$"
@@ -479,17 +493,41 @@ try {
             if ([string]::IsNullOrWhiteSpace($finalGitignore)) {
                 Remove-Item -LiteralPath ".gitignore" -Force
                 git rm -f --cached --ignore-unmatch ".gitignore" >$null 2>&1
-                Write-Success ".gitignore continha apenas regras dos alvos e foi removido."
+                Write-Success ".gitignore continha apenas regras dos alvos e foi limpo."
             } else {
                 Set-Content -LiteralPath ".gitignore" -Value ($finalGitignore + "`n") -NoNewline -Encoding utf8
-                Write-Success "Entradas dos alvos removidas do .gitignore local."
+                Write-Success "Entradas dos alvos removidas do .gitignore."
             }
         }
     }
 
-    # Se o repositório ainda não tinha nenhum commit, o expurgo já está 100% concluído!
+    # Protege os arquivos locais no .git/info/exclude (100% local, nunca sobe para o GitHub nem aparece no .gitignore)
+    $gitDir = (git rev-parse --git-dir).Trim()
+    $excludeFile = Join-Path $gitDir "info\exclude"
+    if (Test-Path -LiteralPath $excludeFile) {
+        $existingExclude = @(Get-Content -LiteralPath $excludeFile)
+        $addedExclude = $false
+        foreach ($tp in $TargetPaths) {
+            if ($existingExclude -notcontains $tp) {
+                Add-Content -LiteralPath $excludeFile -Value $tp -Encoding utf8
+                $addedExclude = $true
+            }
+        }
+        if ($addedExclude) {
+            Write-Success "Alvos registrados em .git/info/exclude (continuam no disco local sem aparecer no git status ou na nuvem)."
+        }
+    }
+
+    # Se o repositório ainda não tinha nenhum commit, restaura o cofre local e encerra!
     if (-not $hasCommits) {
-        Write-Success "O repositório ainda não possuía commits. Todos os arquivos selecionados foram expurgados do disco sem deixar rastros!"
+        foreach ($tp in $preservedItems) {
+            $srcVault = Join-Path $localVaultDir $tp
+            if (-not (Test-Path -LiteralPath $tp) -and (Test-Path -LiteralPath $srcVault)) {
+                Copy-Item -LiteralPath $srcVault -Destination $tp -Recurse -Force
+            }
+        }
+        Remove-Item -LiteralPath $localVaultDir -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Success "O repositório ainda não possuía commits. Os arquivos permanecem intactos no projeto local e fora do índice do Git!"
         return
     }
 
@@ -591,12 +629,24 @@ try {
         }
     }
 
-    # Sincroniza o diretório de trabalho atual com o novo HEAD reescrito (e remove arquivos não rastreados dos alvos)
+    # Sincroniza o diretório de trabalho com o novo HEAD reescrito e RESTAURA os arquivos locais preservados no cofre
     git reset --hard HEAD >$null 2>&1
-    foreach ($tp in $TargetPaths) {
-        if (Test-Path -LiteralPath $tp) {
-            Remove-Item -LiteralPath $tp -Recurse -Force -ErrorAction SilentlyContinue
+    foreach ($tp in $preservedItems) {
+        $srcVault = Join-Path $localVaultDir $tp
+        if (Test-Path -LiteralPath $srcVault) {
+            if (Test-Path -LiteralPath $tp) {
+                Remove-Item -LiteralPath $tp -Recurse -Force -ErrorAction SilentlyContinue
+            }
+            $destParent = Split-Path -Parent $tp
+            if (-not [string]::IsNullOrWhiteSpace($destParent) -and -not (Test-Path -LiteralPath $destParent)) {
+                New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $srcVault -Destination $tp -Recurse -Force
         }
+    }
+    Remove-Item -LiteralPath $localVaultDir -Recurse -Force -ErrorAction SilentlyContinue
+    if ($preservedItems.Count -gt 0) {
+        Write-Success "Arquivos locais restaurados intactos no projeto local (fora da árvore de commits): $($preservedItems -join ', ')"
     }
 
     Write-Success "Reescrita do grafo concluída com preservação estrita de horários."
@@ -688,19 +738,15 @@ try {
         Write-Warn "Foram detectadas $dateMismatchCount divergências de horário."
     }
 
-    # Push remoto se solicitado
+    # Push remoto automático no final do programa
     if ($PushRemote) {
-        if ([string]::IsNullOrWhiteSpace($originUrl)) {
-            Write-Warn "Parâmetro -PushRemote informado, mas nenhum remote 'origin' está configurado."
-        } else {
-            Write-Step "PUSH REMOTO" "Atualizando todas as branches e tags no GitHub ($originUrl)..."
-            git push origin --force --all --prune
-            git push origin --force --tags
+        if (-not [string]::IsNullOrWhiteSpace($originUrl)) {
+            Write-Step "PUSH REMOTO" "Executando git push origin --force --all --prune; git push origin --force --tags ($originUrl)..."
+            git push origin --force --all --prune; git push origin --force --tags
             Write-Success "Histórico remoto atualizado com sucesso em todas as branches e tags!"
+        } else {
+            Write-Warn "Nenhum remote 'origin' configurado neste repositório local (push ignorado)."
         }
-    } elseif (-not [string]::IsNullOrWhiteSpace($originUrl)) {
-        Write-Info "Para atualizar o GitHub agora, execute:"
-        Write-Host "  git push origin --force --all --prune; git push origin --force --tags" -ForegroundColor Yellow
     }
 
     Write-Host "`n========================================================================================" -ForegroundColor Green
