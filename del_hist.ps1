@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Algoritmo de Expurgo Invisível do .agent e Artefatos de IA em Todo o Histórico do Git.
 
@@ -63,7 +63,10 @@ param(
 )
 
 Set-StrictMode -Version Latest
-$ErrorActionPreference = "Stop"
+# Mantém "Continue" para executáveis nativos (evita que stderr do git.exe com 2>&1 dispare NativeCommandError no PowerShell 5.1)
+# e aplica "Stop" automaticamente a todos os cmdlets PowerShell.
+$ErrorActionPreference = "Continue"
+$PSDefaultParameterValues['*:ErrorAction'] = 'Stop'
 
 # ==============================================================================
 # CONFIGURAÇÃO PADRÃO DE ALVOS DO AGENTE
@@ -337,6 +340,8 @@ function Show-InteractivePathSelector {
 # ==============================================================================
 # EXECUÇÃO PRINCIPAL DO ALGORITMO
 # ==============================================================================
+$localVaultDir = $null
+$preservedItems = @()
 Push-Location -LiteralPath $RepoPath
 try {
     # Valida se estamos em um repositório Git válido
@@ -446,7 +451,7 @@ try {
     # Verifica se há alterações locais legítimas (fora dos alvos que serão apagados) antes de mexer no disco
     $stashed = $false
     if ($hasCommits) {
-        $targetRegexParts = ($TargetPaths | ForEach-Object { [Regex]::Escape(($_ -replace '\\', '/').TrimEnd('/')) }) + @([Regex]::Escape($ScriptSelfName), "\.gitignore")
+        $targetRegexParts = ($TargetPaths | ForEach-Object { [Regex]::Escape(($_ -replace '\\', '/').TrimEnd('/')) }) + @("\.gitignore")
         $ignoreStatusRegex = "(?i)($($targetRegexParts -join '|'))"
         $legitDirty = @(git status --porcelain 2>$null | Where-Object { $_ -notmatch $ignoreStatusRegex })
         if ($legitDirty.Count -gt 0) {
@@ -576,17 +581,19 @@ try {
 
         $indexFilterCmd = "git rm -rf --cached --ignore-unmatch -- $quotedPaths >/dev/null 2>&1 || true"
 
-        # Higienização cirúrgica do .gitignore dentro do índice de cada commit (sem checkout de árvore)
+        # Higienização cirúrgica do .gitignore dentro do índice de cada commit (sem checkout de árvore e sem aspas duplas para evitar quebra no PS 5.1)
         if ($CleanGitignore) {
             $grepPattern = ($TargetPaths | ForEach-Object {
                 $p = ($_ -replace '\\', '/').TrimEnd('/')
                 [Regex]::Escape($p)
             }) -join "|"
             $indexFilterCmd += "; if git rev-parse --verify -q :.gitignore >/dev/null 2>&1; then " +
-                "cleaned=`$(git show :.gitignore | grep -v -i -E '^(#.*Relat.*sess.*agente|[[:space:]]*/?($grepPattern)/?[[:space:]]*`$)' || true); " +
-                "if [ -z `"`$cleaned`" ]; then git rm -f --cached --ignore-unmatch .gitignore >/dev/null 2>&1; " +
-                "else newblob=`$(printf '%s\n' `"`$cleaned`" | git hash-object -w --stdin); " +
-                "git update-index --cacheinfo 100644 `"`$newblob`" .gitignore >/dev/null 2>&1; fi; fi"
+                "if git show :.gitignore | grep -q -i -E '^(#.*Relat.*sess.*agente|[[:space:]]*/?($grepPattern)/?[[:space:]]*`$)'; then " +
+                "git show :.gitignore | grep -v -i -E '^(#.*Relat.*sess.*agente|[[:space:]]*/?($grepPattern)/?[[:space:]]*`$)' > .gitignore.purgetmp || true; " +
+                "if [ ! -s .gitignore.purgetmp ] || ! grep -q '[^[:space:]]' .gitignore.purgetmp; then git rm -f --cached --ignore-unmatch .gitignore >/dev/null 2>&1; " +
+                "else newblob=`$(git hash-object -w .gitignore.purgetmp); " +
+                "git update-index --cacheinfo 100644 `$newblob .gitignore >/dev/null 2>&1; fi; " +
+                "rm -f .gitignore.purgetmp; fi; fi"
         }
 
         $filterBranchArgs = @(
@@ -732,5 +739,19 @@ try {
     Write-Host "========================================================================================`n" -ForegroundColor Green
 
 } finally {
+    # Garantia contra falhas: se o cofre temporário ainda existir (ex: interrupção ou erro), restaura os arquivos locais imediatamente
+    if ($null -ne $localVaultDir -and (Test-Path -LiteralPath $localVaultDir)) {
+        foreach ($tp in $preservedItems) {
+            $srcVault = Join-Path $localVaultDir $tp
+            if (Test-Path -LiteralPath $srcVault) {
+                $destParent = Split-Path -Parent $tp
+                if (-not [string]::IsNullOrWhiteSpace($destParent) -and -not (Test-Path -LiteralPath $destParent)) {
+                    New-Item -ItemType Directory -Path $destParent -Force -ErrorAction SilentlyContinue | Out-Null
+                }
+                Copy-Item -LiteralPath $srcVault -Destination $tp -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Remove-Item -LiteralPath $localVaultDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
     Pop-Location
 }
