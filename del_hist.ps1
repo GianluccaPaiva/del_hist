@@ -34,6 +34,9 @@
 
 .PARAMETER SkipBackup
     Não cria o backup espelhado (--mirror) temporário antes da reescrita.
+
+.PARAMETER Pull
+    Sincroniza (puxa) a árvore reescrita do GitHub (origin/<branch>) preservando intactos os arquivos locais (.agent/, AGENTS.md, GEMINI.md, relatorios/), blindando-os no .git/info/exclude e reaplicando commits locais inéditos de código.
 #>
 [CmdletBinding()]
 param(
@@ -59,7 +62,11 @@ param(
     [switch]$DryRun,
 
     [Parameter(Mandatory = $false)]
-    [switch]$SkipBackup
+    [switch]$SkipBackup,
+
+    [Parameter(Mandatory = $false)]
+    [Alias("Sync")]
+    [switch]$Pull
 )
 
 Set-StrictMode -Version Latest
@@ -283,7 +290,7 @@ function Show-InteractivePathSelector {
 
         Write-Host "`n----------------------------------------------------------------------------------------" -ForegroundColor DarkCyan
         Write-Host " [Espaço] Marcar/Desmarcar | [A] Adicionar caminho manual | [P] Só Padrões IA" -ForegroundColor White
-        Write-Host " [Enter]  Confirmar Expurgo | [Esc] ou [Q] Cancelar Operação" -ForegroundColor Green
+        Write-Host " [Enter]  Confirmar Expurgo | [S] Pull Seguro da Nuvem     | [Esc] ou [Q] Cancelar" -ForegroundColor Green
         Write-Host "----------------------------------------------------------------------------------------" -ForegroundColor DarkCyan
 
         $keyInfo = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
@@ -324,6 +331,10 @@ function Show-InteractivePathSelector {
                     $it.Selected = ($it.Category -eq "Padrão Agente")
                 }
             }
+            83 { # 'S' - Pull/Sync seguro da nuvem preservando .agent local
+                $script:PullRequestedFromTui = $true
+                return $Items
+            }
             13 { # Enter
                 return $Items
             }
@@ -342,6 +353,7 @@ function Show-InteractivePathSelector {
 # ==============================================================================
 $localVaultDir = $null
 $preservedItems = @()
+$script:PullRequestedFromTui = $false
 Push-Location -LiteralPath $RepoPath
 try {
     # Valida se estamos em um repositório Git válido
@@ -363,13 +375,16 @@ try {
     # --------------------------------------------------------------------------
     $catalog = Get-RepositoryCatalog -PreSelectedDefaults $DefaultAgentTargets -UserExtraPaths $ExtraPaths
 
-    if (-not $NoInteractive) {
+    if (-not $NoInteractive -and -not $Pull) {
         $catalog = Show-InteractivePathSelector -Items $catalog -BranchName $currentBranch
+    }
+    if ($script:PullRequestedFromTui) {
+        $Pull = $true
     }
 
     $selectedItems = @($catalog | Where-Object { $_.Selected })
     if ($selectedItems.Count -eq 0) {
-        Write-Warn "Nenhum arquivo ou diretório foi selecionado para remoção. Encerrando."
+        Write-Warn "Nenhum arquivo ou diretório foi selecionado. Encerrando."
         return
     }
 
@@ -390,9 +405,10 @@ try {
     }
     $TargetPaths = @($targetPathsSet)
 
-    Write-Step "ESTÁGIO 0" "Branch ativa: [$currentBranch] | Alvos selecionados para expurgo nesta branch:"
+    $modeLabel = if ($Pull) { "PULL/SYNC SEGURO (Preservação Local + Alinhamento de Árvore)" } else { "EXPURGO DE HISTÓRICO" }
+    Write-Step "ESTÁGIO 0" "Branch ativa: [$currentBranch] | Modo: $modeLabel"
     foreach ($tp in $TargetPaths) {
-        Write-Info "-> $tp"
+        Write-Info "-> Alvo protegido localmente: $tp"
     }
 
     # Verifica se o repositório já possui commits
@@ -405,6 +421,190 @@ try {
     $remotes = @(git remote 2>$null)
     if ($remotes -contains "origin") {
         $originUrl = (git remote get-url origin 2>$null).Trim()
+    }
+
+    # ==========================================================================
+    # FLUXO DEDICADO: MODO PULL / SYNC SEGURO (PARA PARCEIROS OU OUTROS CLONES)
+    # ==========================================================================
+    if ($Pull) {
+        if ([string]::IsNullOrWhiteSpace($originUrl)) {
+            throw "Nenhum remote 'origin' configurado neste repositório para puxar a branch '$currentBranch'."
+        }
+
+        Write-Step "PULL-1" "Buscando árvore atualizada do GitHub (origin/$currentBranch)..."
+        git fetch origin $currentBranch --quiet 2>$null
+        git rev-parse --verify "refs/remotes/origin/$currentBranch" >$null 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            throw "A branch remota 'origin/$currentBranch' não foi encontrada no GitHub."
+        }
+
+        if ($DryRun) {
+            Write-Step "DRY-RUN" "Simulação do Pull Seguro na branch '$currentBranch' (nenhuma alteração será gravada)."
+            $localExisting = @($TargetPaths | Where-Object { Test-Path -LiteralPath $_ })
+            Write-Info "Itens locais que serão blindados no cofre e mantidos intactos: $(if ($localExisting.Count -gt 0) { $localExisting -join ', ' } else { 'Nenhum presente no disco' })"
+            if ($hasCommits) {
+                $localHead = (git rev-parse --short HEAD 2>$null).Trim()
+                $remoteHead = (git rev-parse --short "origin/$currentBranch" 2>$null).Trim()
+                Write-Info "HEAD local atual: $localHead | HEAD remoto (origin/$currentBranch): $remoteHead"
+            }
+            return
+        }
+
+        if (-not $SkipBackup -and $hasCommits) {
+            $repoName = Split-Path -Leaf $RepoRoot
+            $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+            $backupPath = Join-Path $env:TEMP "git-mirror-backup-$repoName-$timestamp.git"
+            git clone --mirror --quiet $RepoRoot $backupPath
+            Write-Success "Backup espelhado (--mirror) criado em: $backupPath"
+        }
+
+        # Identifica se existem commits locais inéditos de código (que ainda não existem no origin/<branch> pelo título)
+        $unpublishedCommits = @()
+        if ($hasCommits) {
+            $remoteSubjects = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+            foreach ($rs in @(git log "origin/$currentBranch" --format="%s" 2>$null)) {
+                if (-not [string]::IsNullOrWhiteSpace($rs)) { [void]$remoteSubjects.Add($rs.Trim()) }
+            }
+
+            $localOnlyRaw = @(git log "origin/$currentBranch..$currentBranch" --reverse --format="%H|%aI|%cI|%an|%ae|%s" 2>$null)
+            foreach ($line in $localOnlyRaw) {
+                $parts = $line -split '\|', 6
+                if ($parts.Count -eq 6) {
+                    $subj = $parts[5].Trim()
+                    if (-not $remoteSubjects.Contains($subj)) {
+                        $unpublishedCommits += [PSCustomObject]@{
+                            Hash          = $parts[0]
+                            AuthorDate    = $parts[1]
+                            CommitterDate = $parts[2]
+                            AuthorName    = $parts[3]
+                            AuthorEmail   = $parts[4]
+                            Subject       = $subj
+                        }
+                    }
+                }
+            }
+        }
+
+        # Salva alterações locais não comitadas (fora dos alvos de IA) em stash temporário
+        $stashed = $false
+        if ($hasCommits) {
+            $targetRegexParts = ($TargetPaths | ForEach-Object { [Regex]::Escape(($_ -replace '\\', '/').TrimEnd('/')) }) + @("\.gitignore")
+            $ignoreStatusRegex = "(?i)($($targetRegexParts -join '|'))"
+            $legitDirty = @(git status --porcelain 2>$null | Where-Object { $_ -notmatch $ignoreStatusRegex })
+            if ($legitDirty.Count -gt 0) {
+                git stash push -u -m "temp-stash-before-pull-hist" --quiet >$null 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    $stashed = $true
+                    Write-Info "Alterações locais em andamento (fora dos alvos) guardadas em stash temporário."
+                }
+            }
+        }
+
+        # Guarda os arquivos/pastas locais do agente no cofre temporário antes do reset
+        Write-Step "PULL-2" "Guardando artefatos locais (.agent, etc.) no cofre temporário..."
+        $localVaultDir = Join-Path $env:TEMP "git-local-vault-$([guid]::NewGuid().ToString('N'))"
+        New-Item -ItemType Directory -Path $localVaultDir -Force | Out-Null
+        $preservedItems = @()
+
+        foreach ($tp in $TargetPaths) {
+            if (Test-Path -LiteralPath $tp) {
+                $destPath = Join-Path $localVaultDir $tp
+                $destParent = Split-Path -Parent $destPath
+                if (-not (Test-Path -LiteralPath $destParent)) {
+                    New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+                }
+                Copy-Item -LiteralPath $tp -Destination $destPath -Recurse -Force
+                $preservedItems += $tp
+            }
+        }
+        if ($preservedItems.Count -gt 0) {
+            Write-Success "Cofre local protegido: $($preservedItems -join ', ')"
+        } else {
+            Write-Info "Nenhum artefato dos alvos estava presente no disco antes do pull."
+        }
+
+        # Alinha a árvore local com a árvore reescrita do GitHub
+        Write-Step "PULL-3" "Sincronizando árvore de commits com 'origin/$currentBranch'..."
+        git reset --hard "origin/$currentBranch" >$null 2>&1
+        Write-Success "Branch '$currentBranch' alinhada com a nova árvore remota!"
+
+        # Reaplica commits locais inéditos de código (se o parceiro tinha feito commits locais novos antes de puxar)
+        if ($unpublishedCommits.Count -gt 0) {
+            Write-Step "PULL-4" "Reaplicando $($unpublishedCommits.Count) commit(s) local(is) inédito(s) sobre a nova árvore..."
+            foreach ($uc in $unpublishedCommits) {
+                git cherry-pick --no-commit $uc.Hash >$null 2>&1
+                if ($LASTEXITCODE -eq 0) {
+                    foreach ($tp in $TargetPaths) {
+                        git rm -rf --cached --ignore-unmatch -- $tp >$null 2>&1
+                    }
+                    git diff --cached --quiet >$null 2>&1
+                    if ($LASTEXITCODE -ne 0) {
+                        $env:GIT_AUTHOR_DATE = $uc.AuthorDate
+                        $env:GIT_COMMITTER_DATE = $uc.CommitterDate
+                        git commit -m $uc.Subject --author="$($uc.AuthorName) <$($uc.AuthorEmail)>" --quiet >$null 2>&1
+                        Remove-Item Env:\GIT_AUTHOR_DATE -ErrorAction SilentlyContinue
+                        Remove-Item Env:\GIT_COMMITTER_DATE -ErrorAction SilentlyContinue
+                        Write-Success "Commit local reaplicado sem rastros de IA: '$($uc.Subject)'"
+                    } else {
+                        git reset --hard HEAD >$null 2>&1
+                    }
+                } else {
+                    git cherry-pick --abort >$null 2>&1
+                    Write-Warn "Conflito ao reaplicar automaticamente o commit local '$($uc.Subject)' ($($uc.Hash)). Ele permanece salvo no backup espelhado."
+                }
+            }
+        }
+
+        # Restaura os arquivos locais do cofre de volta para a pasta de trabalho
+        foreach ($tp in $preservedItems) {
+            $srcVault = Join-Path $localVaultDir $tp
+            if (Test-Path -LiteralPath $srcVault) {
+                if (Test-Path -LiteralPath $tp) {
+                    Remove-Item -LiteralPath $tp -Recurse -Force -ErrorAction SilentlyContinue
+                }
+                $destParent = Split-Path -Parent $tp
+                if (-not [string]::IsNullOrWhiteSpace($destParent) -and -not (Test-Path -LiteralPath $destParent)) {
+                    New-Item -ItemType Directory -Path $destParent -Force | Out-Null
+                }
+                Copy-Item -LiteralPath $srcVault -Destination $tp -Recurse -Force
+            }
+        }
+        Remove-Item -LiteralPath $localVaultDir -Recurse -Force -ErrorAction SilentlyContinue
+        if ($preservedItems.Count -gt 0) {
+            Write-Success "Artefatos locais restaurados intactos no diretório do projeto: $($preservedItems -join ', ')"
+        }
+
+        # Blindagem local (.git/info/exclude) para o Git nunca rastrear nem subir o .agent local
+        $gitDir = (git rev-parse --git-dir).Trim()
+        $excludeFile = Join-Path $gitDir "info\exclude"
+        if (-not (Test-Path -LiteralPath $excludeFile)) {
+            $infoDir = Split-Path -Parent $excludeFile
+            if (-not (Test-Path -LiteralPath $infoDir)) { New-Item -ItemType Directory -Path $infoDir -Force | Out-Null }
+            New-Item -ItemType File -Path $excludeFile -Force | Out-Null
+        }
+        $existingExclude = @(Get-Content -LiteralPath $excludeFile -ErrorAction SilentlyContinue)
+        $addedExclude = $false
+        foreach ($tp in $TargetPaths) {
+            if ($existingExclude -notcontains $tp) {
+                Add-Content -LiteralPath $excludeFile -Value $tp -Encoding utf8
+                $addedExclude = $true
+            }
+        }
+        Write-Success "Blindagem ativa em .git/info/exclude (seus arquivos locais não aparecerão no git status nem subirão em futuros pushes)."
+
+        # Limpeza forense dos objetos antigos da árvore pré-expurgo nesta máquina
+        git reflog expire --expire=now --expire-unreachable=now --all >$null 2>&1
+        git gc --prune=now --quiet >$null 2>&1
+
+        if ($stashed) {
+            git stash pop --quiet >$null 2>&1
+            Write-Info "Alterações locais em andamento restauradas do stash."
+        }
+
+        Write-Host "`n========================================================================================" -ForegroundColor Green
+        Write-Host " PULL SEGURO CONCLUÍDO! ÁRVORE SINCRONIZADA E .AGENT LOCAL 100% PRESERVADO!" -ForegroundColor Green
+        Write-Host "========================================================================================`n" -ForegroundColor Green
+        return
     }
 
     if ($DryRun) {

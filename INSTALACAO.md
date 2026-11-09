@@ -2,7 +2,7 @@
 
 Este documento detalha passo a passo como instalar o algoritmo [**`del_hist.ps1`**](./del_hist.ps1) de maneira **global** para que:
 1. **O Agente de IA (Antigravity)** possa acioná-lo automaticamente em qualquer repositório ao estruturar ou manter o `.agent/`.
-2. **Você (Desenvolvedor)** possa digitar apenas a palavra reservada **`del_hist`** em qualquer terminal e dentro de qualquer `git clone` do computador, sem precisar copiar o arquivo `.ps1` para dentro dos seus projetos.
+2. **Você ou seu parceiro de equipe** possam digitar apenas as palavras reservadas **`del_hist`** (para expurgar e subir) ou **`pull_hist`** (para puxar/sincronizar a árvore reescrita sem perder o `.agent/` local) em qualquer terminal e dentro de qualquer `git clone` do computador, sem precisar copiar o arquivo `.ps1` para dentro dos projetos.
 
 > [!IMPORTANT]
 > **Atuação Exclusiva por Branch Ativa:** Quando executado, o `del_hist` atua **apenas sobre a branch em que o terminal está posicionado no momento (`HEAD`)**, limpando a árvore de commits daquela branch e atualizando exclusivamente ela no GitHub (`git push origin --force refs/heads/<branch>:refs/heads/<branch>`), sem alterar outras branches do repositório.
@@ -42,9 +42,11 @@ Para que o agente de IA reconheça a ferramenta em **todos os projetos futuros**
 ### Estrutura de Pastas Global
 ```text
 C:\Users\<SEU_USUARIO>\.gemini\
-├── bin\                                  # Pasta global no PATH do Windows (Palavra reservada)
-│   ├── del_hist.cmd                      # Atalho para CMD / Git Bash / VS Code
-│   └── del_hist.ps1                      # Atalho para PowerShell
+├── bin\                                  # Pasta global no PATH do Windows (Palavras reservadas)
+│   ├── del_hist.cmd                      # Atalho para Expurgo + Push (CMD / Git Bash / VS Code)
+│   ├── del_hist.ps1                      # Atalho para Expurgo + Push (PowerShell)
+│   ├── pull_hist.cmd                     # Atalho para Pull/Sync Seguro preservando .agent local
+│   └── pull_hist.ps1                     # Atalho para Pull/Sync Seguro (PowerShell)
 └── config\
     └── skills\
         ├── bootstrap-agent-workspace\    # Skill que inicializa o .agent
@@ -73,20 +75,21 @@ No arquivo `$HOME\.gemini\config\skills\bootstrap-agent-workspace\SKILL.md`, na 
 
 ---
 
-## 🌐 3. Como Colocar a Palavra Reservada (`del_hist`) nas Variáveis de Ambiente
+## 🌐 3. Como Colocar as Palavras Reservadas (`del_hist` e `pull_hist`) nas Variáveis de Ambiente
 
-Para que você possa abrir o terminal em **qualquer repositório (`git clone`)** e digitar apenas `del_hist` (ou qualquer outra palavra reservada que desejar), execute o bloco de instalação abaixo no PowerShell.
+Para que você ou seu parceiro possam abrir o terminal em **qualquer repositório (`git clone`)** e digitar apenas `del_hist` (para limpar e dar push) ou `pull_hist` (para puxar a árvore reescrita mantendo o `.agent/` local intacto), execute o bloco de instalação abaixo no PowerShell.
 
 Ele realiza **3 configurações simultâneas**:
-1. Cria os lançadores em `$HOME\.gemini\bin` (`del_hist.cmd` e `del_hist.ps1`).
-2. Adiciona `$HOME\.gemini\bin` na variável de ambiente **`Path`** permanente do seu usuário no Windows e cria a variável `$env:del_hist`.
-3. Registra a função `del_hist` no perfil global do PowerShell (`$PROFILE.CurrentUserAllHosts`).
+1. Cria os lançadores em `$HOME\.gemini\bin` (`del_hist.cmd`/`.ps1` e `pull_hist.cmd`/`.ps1`).
+2. Adiciona `$HOME\.gemini\bin` na variável de ambiente **`Path`** permanente do seu usuário no Windows e cria as variáveis `$env:del_hist` e `$env:pull_hist`.
+3. Registra as funções `del_hist` e `pull_hist` no perfil global do PowerShell (`$PROFILE.CurrentUserAllHosts`).
 
-### Script Único de Registro da Palavra Reservada
+### Script Único de Registro das Palavras Reservadas
 
 ```powershell
-# Defina aqui a palavra reservada que deseja usar no terminal (ex: "del_hist")
+# Defina aqui as palavras reservadas que deseja usar no terminal
 $PalavraReservada = "del_hist"
+$PalavraPull = "pull_hist"
 
 $BinDir = "$HOME\.gemini\bin"
 $ScriptOficial = "$HOME\.gemini\config\skills\git-history-purge\scripts\del_hist.ps1"
@@ -94,6 +97,7 @@ $ScriptOficial = "$HOME\.gemini\config\skills\git-history-purge\scripts\del_hist
 # 1. Cria a pasta bin global e os arquivos lançadores (.cmd e .ps1)
 New-Item -ItemType Directory -Path $BinDir -Force | Out-Null
 
+# Lançadores para del_hist (Expurgo + Force-Push)
 $CmdContent = @"
 @echo off
 where pwsh >nul 2>nul
@@ -104,9 +108,20 @@ if %ERRORLEVEL% EQU 0 (
 )
 "@
 Set-Content -LiteralPath "$BinDir\$PalavraReservada.cmd" -Value $CmdContent -Encoding ascii
+Set-Content -LiteralPath "$BinDir\$PalavraReservada.ps1" -Value "& `"$ScriptOficial`" @args" -Encoding utf8
 
-$Ps1Launcher = "& `"$ScriptOficial`" @args"
-Set-Content -LiteralPath "$BinDir\$PalavraReservada.ps1" -Value $Ps1Launcher -Encoding utf8
+# Lançadores para pull_hist (Pull/Sync Seguro preservando .agent local)
+$PullCmdContent = @"
+@echo off
+where pwsh >nul 2>nul
+if %ERRORLEVEL% EQU 0 (
+    pwsh -NoProfile -ExecutionPolicy Bypass -File "$ScriptOficial" -Pull %*
+) else (
+    powershell -NoProfile -ExecutionPolicy Bypass -File "$ScriptOficial" -Pull %*
+)
+"@
+Set-Content -LiteralPath "$BinDir\$PalavraPull.cmd" -Value $PullCmdContent -Encoding ascii
+Set-Content -LiteralPath "$BinDir\$PalavraPull.ps1" -Value "& `"$ScriptOficial`" -Pull @args" -Encoding utf8
 
 # 2. Adiciona a pasta bin ao PATH permanente do Usuário no Windows
 $UserPath = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -117,9 +132,10 @@ if ($PathList -notcontains $BinDir) {
     Write-Host "[OK] '$BinDir' adicionado ao PATH permanente do Windows." -ForegroundColor Green
 }
 
-# 3. Cria a variável de ambiente dedicada com o nome da palavra reservada
+# 3. Cria as variáveis de ambiente dedicadas
 [Environment]::SetEnvironmentVariable($PalavraReservada, $ScriptOficial, "User")
-Write-Host "[OK] Variável de ambiente '$PalavraReservada' registrada." -ForegroundColor Green
+[Environment]::SetEnvironmentVariable($PalavraPull, "$ScriptOficial -Pull", "User")
+Write-Host "[OK] Variáveis de ambiente '$PalavraReservada' e '$PalavraPull' registradas." -ForegroundColor Green
 
 # 4. Registra no PowerShell Profile (carregamento instantâneo em qualquer sessão PowerShell)
 $ProfilePath = $PROFILE.CurrentUserAllHosts
@@ -127,10 +143,15 @@ $ProfileDir = Split-Path -Parent $ProfilePath
 if (-not (Test-Path -LiteralPath $ProfileDir)) {
     New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
 }
-$FunctionLine = "function $PalavraReservada { & `"$ScriptOficial`" @args }"
+$FunctionDel = "function $PalavraReservada { & `"$ScriptOficial`" @args }"
+$FunctionPull = "function $PalavraPull { & `"$ScriptOficial`" -Pull @args }"
 if (-not (Test-Path -LiteralPath $ProfilePath) -or ((Get-Content -LiteralPath $ProfilePath -Raw) -notmatch "function $PalavraReservada\b")) {
-    Add-Content -LiteralPath $ProfilePath -Value "`n$FunctionLine`n" -Encoding utf8
+    Add-Content -LiteralPath $ProfilePath -Value "`n$FunctionDel`n" -Encoding utf8
     Write-Host "[OK] Função '$PalavraReservada' adicionada ao PowerShell Profile: $ProfilePath" -ForegroundColor Green
+}
+if ((Get-Content -LiteralPath $ProfilePath -Raw) -notmatch "function $PalavraPull\b") {
+    Add-Content -LiteralPath $ProfilePath -Value "$FunctionPull`n" -Encoding utf8
+    Write-Host "[OK] Função '$PalavraPull' adicionada ao PowerShell Profile: $ProfilePath" -ForegroundColor Green
 }
 ```
 
@@ -141,12 +162,13 @@ if (-not (Test-Path -LiteralPath $ProfilePath) -or ((Get-Content -LiteralPath $P
 Após executar os passos acima, abra um **novo terminal** em qualquer pasta e execute:
 
 ```powershell
-# 1. Verifica se o Windows reconhece a palavra reservada del_hist
-Get-Command del_hist
+# 1. Verifica se o Windows reconhece as palavras reservadas del_hist e pull_hist
+Get-Command del_hist, pull_hist
 
 # 2. Testa em modo de simulação (-DryRun) dentro de qualquer repositório Git
 cd C:\caminho\de\qualquer\repositorio
 del_hist -DryRun -NoInteractive
+pull_hist -DryRun
 ```
 
 ---

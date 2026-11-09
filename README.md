@@ -14,7 +14,7 @@ O **`del_hist`** ([`del_hist.ps1`](./del_hist.ps1)) é uma ferramenta de automa�
 
 ## 📂 Estrutura do Repositório
 
-* **[`del_hist.ps1`](./del_hist.ps1)** *(736 linhas)*: O motor principal do algoritmo em PowerShell, contendo a interface interativa no terminal (TUI), o catálogo de varredura de histórico (`Get-RepositoryCatalog`), o cofre de preservação local e a reescrita forense do Git.
+* **[`del_hist.ps1`](./del_hist.ps1)** *(957 linhas)*: O motor principal do algoritmo em PowerShell, contendo a interface interativa no terminal (TUI), o catálogo de varredura de histórico (`Get-RepositoryCatalog`), o cofre de preservação local, o modo de sincronização segura (`-Pull` / `pull_hist`) e a reescrita forense do Git.
 * **[`README.md`](./README.md)**: Documentação da arquitetura em 6 estágios, detalhamento técnico da implementação, casos especiais (commits mistos, merges entre branches, múltiplos clones), parâmetros de CLI e guia de rollback.
 * **[`INSTALACAO.md`](./INSTALACAO.md)**: Guia para registrar o `del_hist` globalmente no `PATH` do Windows (`~/.gemini/bin`), no perfil do PowerShell (`$PROFILE`) e integrá-lo como uma *skill* global do agente (`git-history-purge`).
 
@@ -30,6 +30,7 @@ O **`del_hist`** ([`del_hist.ps1`](./del_hist.ps1)) é uma ferramenta de automa�
 | **Seletor Interativo TUI no Terminal** | Lista todos os diretórios e arquivos (tanto os ativos no disco quanto os já deletados em commits passados) permitindo marcar/desmarcar com as setas `↑`/`↓` e `[Espaço]`. |
 | **Desmembramento de Commits Mistos** | Se um commit antigo alterou código legítimo + `.agent` juntos, apenas o `.agent` é retirado daquele commit; o código legítimo permanece com sua mensagem e horário originais. |
 | **Isolamento por Branch Ativa** | Atua exclusivamente sobre a branch em que você está posicionado (`HEAD`), atualizando apenas ela no GitHub com `git push --force`. |
+| **Pull/Sync Seguro para Parceiros (`pull_hist` / `-Pull`)** | Sincroniza qualquer outro clone ou máquina de parceiro com a árvore reescrita do GitHub **sem apagar o `.agent/` local dele**, reaplicando commits locais inéditos de código e blindando o `.git/info/exclude`. |
 
 ---
 
@@ -100,13 +101,19 @@ Se em um único commit você subiu arquivos do projeto (ex: `src/app.ts`) junto 
 
 ---
 
-### 3. Outros Clones na Mesma Máquina ou Equipe
-- Como a reescrita de histórico altera os hashes SHA-1 no GitHub (`git push --force`), se você tiver o mesmo repositório clonado em outro computador ou outra pasta, **não faça `git pull` comum seguido de `git push`** naquele clone antigo (pois isso mesclaria a árvore antiga com a nova).
-- Nos outros clones, atualize rodando:
+### 3. Outros Clones na Mesma Máquina ou Parceiros de Equipe (`pull_hist`)
+- Como a reescrita de histórico altera os hashes SHA-1 no GitHub (`git push --force`), se você tiver o mesmo repositório clonado em outro computador ou trabalhar com um parceiro:
+  - **Não faça `git pull` comum**, pois isso mesclaria a árvore antiga (com `.agent`) com a nova.
+  - **Não faça `git reset --hard origin/<branch>` manual se o `.agent` já estava rastreado**, pois o Git apagaria o `.agent` local do parceiro ao ver que ele deixou de existir no remoto.
+- **Solução Global Automatizada:** Basta você ou seu parceiro rodarem o comando global **`pull_hist`** (ou `del_hist -Pull`, ou apertar **`[S]`** no menu do `del_hist`):
   ```powershell
-  git fetch origin
-  git reset --hard origin/<nome-da-branch>
+  pull_hist
   ```
+  O modo `-Pull` executa automaticamente:
+  1. Guarda o `.agent/`, `AGENTS.md`, `GEMINI.md` e `relatorios/` locais em um cofre temporário seguro (e faz `stash` de alterações de código em andamento).
+  2. Faz `git fetch origin <branch>` e alinha a árvore local com a nova árvore limpa (`git reset --hard origin/<branch>`).
+  3. Se o parceiro tinha feito commits locais inéditos de código antes de puxar, reaplica-os automaticamente sobre a nova árvore sem rastros de `.agent` e mantendo os horários originais.
+  4. Devolve o `.agent/` local intacto para a pasta do projeto, ativa a blindagem no `.git/info/exclude` da máquina dele e limpa os objetos órfãos da árvore antiga (`reflog` + `gc`).
 
 ---
 
@@ -142,12 +149,22 @@ No menu interativo:
 - **`[A]`**: Permite digitar manualmente o caminho de um arquivo ou pasta extra.
 - **`[P]`**: Restaura a seleção apenas para os padrões de IA (`.agent`, `AGENTS.md`, `GEMINI.md`, `relatorios`).
 - **`[Enter]`**: Confirma e inicia o expurgo + push para o GitHub.
+- **`[S]`**: Executa o **Pull/Sync Seguro** da nuvem preservando os itens marcados no disco local.
 - **`[Esc]` ou `[Q]`**: Cancela a operação sem alterar nada.
+
+### Sincronizar / Puxar Árvore Reescrita (`pull_hist`)
+Para puxar as atualizações de uma branch que teve a árvore reescrita sem perder seu `.agent/` local:
+```powershell
+pull_hist
+# Ou equivalente:
+del_hist -Pull
+```
 
 ### Parâmetros de Linha de Comando (CLI)
 
 | Parâmetro | Tipo | Padrão | Descrição |
 |:---|:---|:---|:---|
+| `-Pull` *(alias `-Sync`)* | `switch` | Desativado | Puxa e alinha a branch atual com `origin/<branch>` mantendo o `.agent` local intacto, reaplicando commits locais inéditos e blindando o `.git/info/exclude`. |
 | `-RepoPath` | `string` | Pasta atual | Caminho do repositório Git alvo. |
 | `-ExtraPaths` | `string[]` | `@()` | Lista de pastas ou arquivos extras para expurgar além dos padrões. |
 | `-NoInteractive` | `switch` | Desativado | Pula o menu TUI e executa direto com os padrões + `-ExtraPaths`. |
