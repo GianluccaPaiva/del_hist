@@ -71,7 +71,7 @@ Copy-Item -LiteralPath ".\del_hist.ps1" -Destination "$SkillDir\scripts\del_hist
 
 ### Como Conectar ao `.agent` (`bootstrap-agent-workspace`)
 No arquivo `$HOME\.gemini\config\skills\bootstrap-agent-workspace\SKILL.md`, na seção **Passo 8 (Privacidade e Git)**, mantenha a diretriz de mutualismo:
-> **Mutualismo com `git-history-purge`:** Sempre que o usuário solicitar a remoção de `.agent/`, `AGENTS.md`, `GEMINI.md` ou `relatorios/` da árvore de commits e da nuvem (GitHub) mantendo-os intactos na máquina local, o agente deve acionar a skill `git-history-purge` e executar `$HOME\.gemini\config\skills\git-history-purge\scripts\del_hist.ps1 -RepoPath "<caminho>" -NoInteractive`.
+> **Mutualismo com `git-history-purge`:** Sempre que o usuário solicitar a remoção de `.agent/`, `AGENTS.md`, `GEMINI.md` ou `relatorios/` da árvore de commits e da nuvem (GitHub) mantendo-os intactos na máquina local, o agente deve acionar a skill [`git-history-purge`](file:///C:/Users/isabe/.gemini/config/skills/git-history-purge/SKILL.md) e executar `$HOME\.gemini\config\skills\git-history-purge\scripts\del_hist.ps1 -RepoPath "<caminho>" -NoInteractive` (palavra reservada: `del_hist`). Quando o usuário ou um parceiro de equipe precisar puxar (`pull`) uma branch cuja árvore foi reescrita no GitHub sem perder seu `.agent/` local, deve executar `$HOME\.gemini\config\skills\git-history-purge\scripts\del_hist.ps1 -RepoPath "<caminho>" -Pull` (palavra reservada: `pull_hist`).
 
 ---
 
@@ -137,21 +137,29 @@ if ($PathList -notcontains $BinDir) {
 [Environment]::SetEnvironmentVariable($PalavraPull, "$ScriptOficial -Pull", "User")
 Write-Host "[OK] Variáveis de ambiente '$PalavraReservada' e '$PalavraPull' registradas." -ForegroundColor Green
 
-# 4. Registra no PowerShell Profile (carregamento instantâneo em qualquer sessão PowerShell)
-$ProfilePath = $PROFILE.CurrentUserAllHosts
-$ProfileDir = Split-Path -Parent $ProfilePath
-if (-not (Test-Path -LiteralPath $ProfileDir)) {
-    New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
-}
+# 4. Registra nos Profiles do PowerShell 5.1 e PowerShell 7+ (carregamento instantâneo em qualquer sessão)
+$DocsDir = [Environment]::GetFolderPath("MyDocuments")
+$Profiles = @(
+    $PROFILE.CurrentUserAllHosts,
+    (Join-Path $DocsDir "WindowsPowerShell\profile.ps1"),
+    (Join-Path $DocsDir "PowerShell\profile.ps1")
+) | Select-Object -Unique
+
 $FunctionDel = "function $PalavraReservada { & `"$ScriptOficial`" @args }"
 $FunctionPull = "function $PalavraPull { & `"$ScriptOficial`" -Pull @args }"
-if (-not (Test-Path -LiteralPath $ProfilePath) -or ((Get-Content -LiteralPath $ProfilePath -Raw) -notmatch "function $PalavraReservada\b")) {
-    Add-Content -LiteralPath $ProfilePath -Value "`n$FunctionDel`n" -Encoding utf8
-    Write-Host "[OK] Função '$PalavraReservada' adicionada ao PowerShell Profile: $ProfilePath" -ForegroundColor Green
-}
-if ((Get-Content -LiteralPath $ProfilePath -Raw) -notmatch "function $PalavraPull\b") {
-    Add-Content -LiteralPath $ProfilePath -Value "$FunctionPull`n" -Encoding utf8
-    Write-Host "[OK] Função '$PalavraPull' adicionada ao PowerShell Profile: $ProfilePath" -ForegroundColor Green
+
+foreach ($ProfilePath in $Profiles) {
+    $ProfileDir = Split-Path -Parent $ProfilePath
+    if (-not (Test-Path -LiteralPath $ProfileDir)) {
+        New-Item -ItemType Directory -Path $ProfileDir -Force | Out-Null
+    }
+    if (-not (Test-Path -LiteralPath $ProfilePath) -or ((Get-Content -LiteralPath $ProfilePath -Raw) -notmatch "function $PalavraReservada\b")) {
+        Add-Content -LiteralPath $ProfilePath -Value "`n$FunctionDel`n" -Encoding utf8
+    }
+    if ((Get-Content -LiteralPath $ProfilePath -Raw) -notmatch "function $PalavraPull\b") {
+        Add-Content -LiteralPath $ProfilePath -Value "$FunctionPull`n" -Encoding utf8
+    }
+    Write-Host "[OK] Funções '$PalavraReservada' e '$PalavraPull' ativas no Profile: $ProfilePath" -ForegroundColor Green
 }
 ```
 
