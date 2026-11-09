@@ -1,8 +1,11 @@
 # ⚙️ Guia de Instalação Global e Variáveis de Ambiente (`INSTALACAO.md`)
 
-Este documento detalha passo a passo como instalar o algoritmo [**`del_hist.ps1`**](file:///C:/Users/gianl/teste/del_hist.ps1) de maneira **global** para que:
+Este documento detalha passo a passo como instalar o algoritmo [**`del_hist.ps1`**](./del_hist.ps1) de maneira **global** para que:
 1. **O Agente de IA (Antigravity)** possa acioná-lo automaticamente em qualquer repositório ao estruturar ou manter o `.agent/`.
 2. **Você (Desenvolvedor)** possa digitar apenas a palavra reservada **`del_hist`** em qualquer terminal e dentro de qualquer `git clone` do computador, sem precisar copiar o arquivo `.ps1` para dentro dos seus projetos.
+
+> [!IMPORTANT]
+> **Atuação Exclusiva por Branch Ativa:** Quando executado, o `del_hist` atua **apenas sobre a branch em que o terminal está posicionado no momento (`HEAD`)**, limpando a árvore de commits daquela branch e atualizando exclusivamente ela no GitHub (`git push origin --force refs/heads/<branch>:refs/heads/<branch>`), sem alterar outras branches do repositório.
 
 ---
 
@@ -151,7 +154,7 @@ del_hist -DryRun -NoInteractive
 ## 🔄 5. Manutenção: Como Atualizar ou Trocar a Palavra Reservada
 
 ### Atualizar o Algoritmo Global
-Sempre que você fizer melhorias no arquivo [`del_hist.ps1`](file:///C:/Users/gianl/teste/del_hist.ps1), basta copiá-lo novamente para a pasta da skill global:
+Sempre que você fizer melhorias no arquivo [`del_hist.ps1`](./del_hist.ps1), basta copiá-lo novamente para a pasta da skill global:
 ```powershell
 Copy-Item -LiteralPath ".\del_hist.ps1" -Destination "$HOME\.gemini\config\skills\git-history-purge\scripts\del_hist.ps1" -Force
 ```
